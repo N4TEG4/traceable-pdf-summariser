@@ -10,12 +10,9 @@ import fitz  # PyMuPDF
 import faiss
 
 import torch
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, CrossEncoder
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
-
-
-# Data containers
 
 @dataclass
 class Chunk:
@@ -33,11 +30,7 @@ class Bullet:
     support_label: str
 
 
-# ----------------------------
-# PDF parsing + preprocessing
-# ----------------------------
 def extract_pdf_pages(pdf_bytes: bytes) -> List[Tuple[int, str]]:
-    """Return list of (page_number_1indexed, text)."""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     pages: List[Tuple[int, str]] = []
     for i in range(len(doc)):
@@ -47,71 +40,35 @@ def extract_pdf_pages(pdf_bytes: bytes) -> List[Tuple[int, str]]:
 
 
 def clean_text(s: str) -> str:
-    """
-    Clean extracted text to reduce odd characters and spacing artifacts.
-    This helps both embeddings and summarisation.
-    """
     if not s:
         return ""
-
-    # Normalize unicode (e.g., weird ligatures)
     s = unicodedata.normalize("NFKC", s)
-
-    # Drop control characters (keep \n, \t)
     s = "".join(ch for ch in s if (ch == "\n" or ch == "\t" or ord(ch) >= 32))
-
-    # Normalize whitespace
     s = s.replace("\x00", " ")
     s = re.sub(r"[ \t]+", " ", s)
     s = re.sub(r"\n{3,}", "\n\n", s)
-
-    # Fix spaced punctuation like "word ." -> "word."
     s = re.sub(r"\s+([.,;:!?])", r"\1", s)
-
     return s.strip()
 
 
 def clean_generated_text(s: str) -> str:
-    """
-    Light post-processing for generated summaries to reduce stray artifacts.
-    Keep it conservative to avoid damaging meaning.
-    """
     s = clean_text(s)
-    # Remove repeated punctuation like "...." -> "."
     s = re.sub(r"\.{3,}", "...", s)
     s = re.sub(r"([!?]){2,}", r"\1", s)
-    # Remove awkward double spaces
     s = re.sub(r" {2,}", " ", s)
     return s.strip()
 
 
 def split_into_sentences(text: str) -> List[str]:
-    """
-    Simple sentence-ish splitter that doesn't require external models.
-    It's not perfect, but it's a big improvement over raw character slicing.
-    """
     text = clean_text(text)
     if not text:
         return []
-
-    # Replace newlines with spaces (PDF extraction often inserts hard breaks)
     text = re.sub(r"\s*\n\s*", " ", text).strip()
-
-    # Split on punctuation followed by whitespace.
     parts = re.split(r"(?<=[.!?])\s+", text)
-    parts = [p.strip() for p in parts if p and p.strip()]
-    return parts
+    return [p.strip() for p in parts if p and p.strip()]
 
 
-def chunk_pages(
-    pages: List[Tuple[int, str]],
-    max_chunk_chars: int = 900,
-) -> List[Chunk]:
-    """
-    Sentence-ish chunking:
-    - Build chunks by adding full sentences until size limit
-    - Avoid mid-sentence splitting => much more coherent summaries
-    """
+def chunk_pages(pages: List[Tuple[int, str]], max_chunk_chars: int = 900) -> List[Chunk]:
     chunks: List[Chunk] = []
     cid = 0
 
@@ -126,7 +83,6 @@ def chunk_pages(
 
         current = ""
         for sent in sentences:
-            # If one sentence is huge, hard-split it safely on word boundary
             if len(sent) > max_chunk_chars:
                 words = sent.split()
                 buf = ""
@@ -146,9 +102,7 @@ def chunk_pages(
 
             if not current:
                 current = sent
-                continue
-
-            if len(current) + 1 + len(sent) <= max_chunk_chars:
+            elif len(current) + 1 + len(sent) <= max_chunk_chars:
                 current = current + " " + sent
             else:
                 chunks.append(Chunk(cid, page_no, current.strip()))
@@ -162,14 +116,7 @@ def chunk_pages(
     return chunks
 
 
-
-# Vector index (FAISS) + retrieval
-
 def build_faiss_index(embeddings: np.ndarray) -> faiss.IndexFlatIP:
-    """
-    Use cosine similarity by L2-normalising vectors,
-    then doing inner-product search (IndexFlatIP).
-    """
     emb = embeddings.astype("float32")
     faiss.normalize_L2(emb)
     index = faiss.IndexFlatIP(emb.shape[1])
@@ -177,27 +124,12 @@ def build_faiss_index(embeddings: np.ndarray) -> faiss.IndexFlatIP:
     return index
 
 
-def retrieve(
-    query: str,
-    embedder: SentenceTransformer,
-    index: faiss.IndexFlatIP,
-    chunks: List[Chunk],
-    top_k: int = 5,
-) -> List[Chunk]:
-    q = embedder.encode([query], convert_to_numpy=True).astype("float32")
+def retrieve_ids(query_vec: np.ndarray, index: faiss.IndexFlatIP, top_k: int) -> List[int]:
+    q = query_vec.astype("float32")
     faiss.normalize_L2(q)
     _, ids = index.search(q, top_k)
+    return [int(i) for i in ids[0] if i != -1]
 
-    out: List[Chunk] = []
-    for idx in ids[0]:
-        if idx == -1:
-            continue
-        out.append(chunks[int(idx)])
-    return out
-
-
-
-# Evidence + support scoring
 
 def make_evidence_quotes(chunks: List[Chunk], max_quote_chars: int = 280) -> List[str]:
     quotes: List[str] = []
@@ -209,30 +141,19 @@ def make_evidence_quotes(chunks: List[Chunk], max_quote_chars: int = 280) -> Lis
     return quotes
 
 
-def support_score(
-    bullet_text: str,
-    evidence_chunks: List[Chunk],
-    embedder: SentenceTransformer,
-) -> float:
-    """
-    Simple grounding check:
-    max cosine similarity between bullet and any evidence chunk.
-    """
+def support_score(bullet_text: str, evidence_chunks: List[Chunk], embedder: SentenceTransformer) -> float:
     texts = [bullet_text] + [c.text for c in evidence_chunks]
     vecs = embedder.encode(texts, convert_to_numpy=True).astype("float32")
     faiss.normalize_L2(vecs)
-
     b = vecs[0]
     ev = vecs[1:]
     if ev.shape[0] == 0:
         return 0.0
-
     sims = (ev @ b).tolist()
     return float(max(sims))
 
 
 def label_support(score: float) -> str:
-    # Tuneable thresholds 
     if score >= 0.55:
         return "Supported"
     if score >= 0.42:
@@ -240,22 +161,61 @@ def label_support(score: float) -> str:
     return "Potentially unsupported"
 
 
+def dedupe_chunks(chunks: List[Chunk]) -> List[Chunk]:
+    seen = set()
+    out: List[Chunk] = []
+    for c in chunks:
+        key = clean_text(c.text)
+        if key and key not in seen:
+            seen.add(key)
+            out.append(c)
+    return out
 
-# Main system
+
+def diversify_by_page(candidates: List[Chunk], desired_k: int) -> List[Chunk]:
+    """
+    Prefer evidence across different pages when possible.
+    Greedy selection:
+      - pick first chunk
+      - then prefer chunks from new pages
+      - then fill remaining
+    """
+    if len(candidates) <= desired_k:
+        return candidates
+
+    selected: List[Chunk] = []
+    used_pages = set()
+
+    # First pass: new pages
+    for c in candidates:
+        if c.page not in used_pages:
+            selected.append(c)
+            used_pages.add(c.page)
+        if len(selected) >= desired_k:
+            return selected
+
+    # Second pass: fill
+    for c in candidates:
+        if c not in selected:
+            selected.append(c)
+        if len(selected) >= desired_k:
+            break
+
+    return selected
+
 
 class SummarisationSystem:
     def __init__(
         self,
         embed_model: str = "sentence-transformers/all-MiniLM-L6-v2",
+        reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
         summariser_model: str = "facebook/bart-large-cnn",
         device: str | None = None,
     ):
-        """
-        device:
-          - None -> auto (cuda if available else cpu)
-          - "cpu" or "cuda"
-        """
         self.embedder = SentenceTransformer(embed_model)
+
+        # Cross-encoder reranker (CPU is fine for reranking ~20 pairs)
+        self.reranker = CrossEncoder(reranker_model)
 
         self.sum_tokenizer = AutoTokenizer.from_pretrained(summariser_model)
         self.sum_model = AutoModelForSeq2SeqLM.from_pretrained(summariser_model)
@@ -263,21 +223,16 @@ class SummarisationSystem:
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = device
-
         self.sum_model.to(self.device)
         self.sum_model.eval()
 
     def _safe_summarise(
         self,
         text: str,
-        max_input_tokens: int = 900,  # stay under BART limit (~1024)
+        max_input_tokens: int = 900,
         max_new_tokens: int = 90,
         min_new_tokens: int = 35,
     ) -> str:
-        """
-        Summarise text safely by truncating INPUT BY TOKENS before generation.
-        Also adds generation constraints to reduce garbled/repetitive output.
-        """
         text = clean_text(text)
         if not text:
             return ""
@@ -304,17 +259,9 @@ class SummarisationSystem:
         out = self.sum_tokenizer.decode(out_ids[0], skip_special_tokens=True)
         return clean_generated_text(out)
 
-    def index_pdf(
-        self,
-        pdf_bytes: bytes,
-        chunk_size: int = 900,
-        overlap: int = 150,  # kept for API compatibility; not used by new chunker
-    ) -> Dict[str, Any]:
+    def index_pdf(self, pdf_bytes: bytes, chunk_size: int = 900, overlap: int = 150) -> Dict[str, Any]:
         pages = extract_pdf_pages(pdf_bytes)
-
-        # Sentence-ish chunker uses max_chunk_chars; overlap is not required
         chunks = chunk_pages(pages, max_chunk_chars=chunk_size)
-
         if not chunks:
             raise ValueError("No extractable text found in the PDF (may be scanned images).")
 
@@ -323,11 +270,34 @@ class SummarisationSystem:
         return {"pages": pages, "chunks": chunks, "embeddings": embeddings, "index": index}
 
     def baseline_summary(self, full_text: str) -> str:
-        """
-        Baseline: summarise without retrieval/grounding (still token-safe).
-        For very long docs this becomes "summary of the beginning", which is fine for a baseline.
-        """
         return self._safe_summarise(full_text, max_input_tokens=900, max_new_tokens=180, min_new_tokens=60)
+
+    def _retrieve_and_rerank(
+        self,
+        query: str,
+        index_bundle: Dict[str, Any],
+        retrieve_k: int,
+        final_k: int,
+    ) -> List[Chunk]:
+        chunks: List[Chunk] = index_bundle["chunks"]
+        index = index_bundle["index"]
+
+        q_vec = self.embedder.encode([query], convert_to_numpy=True)
+        ids = retrieve_ids(q_vec, index, top_k=retrieve_k)
+        candidates = [chunks[i] for i in ids]
+        candidates = dedupe_chunks(candidates)
+
+        if not candidates:
+            return []
+
+        # Rerank with cross-encoder
+        pairs = [(query, c.text) for c in candidates]
+        scores = self.reranker.predict(pairs)
+
+        ranked = [c for _, c in sorted(zip(scores, candidates), key=lambda x: x[0], reverse=True)]
+        ranked = diversify_by_page(ranked, desired_k=final_k)
+
+        return ranked[:final_k]
 
     def rag_bullets(
         self,
@@ -337,30 +307,17 @@ class SummarisationSystem:
         bullet_max_new_tokens: int = 90,
         bullet_min_new_tokens: int = 35,
         max_evidence_input_tokens: int = 900,
+        retrieve_k: int = 20,
     ) -> List[Bullet]:
-        """
-        For each query/topic:
-          retrieve top-k chunks,
-          summarise only retrieved evidence (grounded),
-          attach page citations + evidence quotes,
-          score support.
-        """
-        chunks: List[Chunk] = index_bundle["chunks"]
-        index = index_bundle["index"]
-
         bullets: List[Bullet] = []
-        for q in query_list:
-            ev_chunks = retrieve(q, self.embedder, index, chunks, top_k=top_k)
 
-            # Deduplicate evidence chunks (prevents repetition and improves coherence)
-            seen = set()
-            deduped: List[Chunk] = []
-            for c in ev_chunks:
-                key = clean_text(c.text)
-                if key and key not in seen:
-                    seen.add(key)
-                    deduped.append(c)
-            ev_chunks = deduped
+        for q in query_list:
+            ev_chunks = self._retrieve_and_rerank(
+                query=q,
+                index_bundle=index_bundle,
+                retrieve_k=retrieve_k,
+                final_k=top_k,
+            )
 
             if not ev_chunks:
                 bullets.append(
@@ -375,7 +332,6 @@ class SummarisationSystem:
                 continue
 
             evidence_text = "\n\n".join([c.text for c in ev_chunks])
-
             summary = self._safe_summarise(
                 evidence_text,
                 max_input_tokens=max_evidence_input_tokens,

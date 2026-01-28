@@ -7,3 +7,4 @@ torch>=2.2
 numpy>=1.26
 sentencepiece>=0.2
 plotly>=5.18
+scikit-learn>=1.3
