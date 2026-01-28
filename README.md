@@ -13,3 +13,6 @@ A Streamlit prototype that generates traceable study summaries from PDFs using r
 ## Setup
 ```bash
 python -m pip install -r requirements.txt
+
+## Run
+python -m streamlit run app.py
